@@ -1,0 +1,166 @@
+================================================================================
+  HƯỚNG DẪN & GIẢI THÍCH CHI TIẾT CƠ CHẾ HOẠT ĐỘNG VÀ THU THẬP DỮ LIỆU
+  HỆ THỐNG DOMAINRADAR ASYNC SCANNER (WSL2 EDITION)
+================================================================================
+
+1. TỔNG QUAN HỆ THỐNG
+--------------------------------------------------------------------------------
+Hệ thống này là một bộ quét thu thập đặc trưng tên miền quy mô lớn (Large-Scale 
+Domain Feature Extraction Scanner). Mục tiêu chính là quét hàng triệu tên miền 
+(từ file labeled_domains.csv) để thu thập các đặc trưng mạng chuyên sâu 
+(DNS, TLS/SSL, RDAP Domain, RDAP IP) phục vụ cho bài toán huấn luyện và so sánh 
+các mô hình Học máy (Machine Learning) phát hiện tên miền độc hại / lừa đảo / lành tính.
+
+Hệ thống được tối ưu hóa đặc biệt cho môi trường WSL2/Linux:
+- Tốc độ quét cực cao nhờ cơ chế bất đồng bộ (asyncio + uvloop + thread pool).
+- Tiết kiệm bộ nhớ (RAM chỉ tiêu thụ ~300MB - 600MB) nhờ cơ chế streaming dữ liệu.
+- Cơ chế Checkpoint thông minh (Resume): Có thể dừng và chạy tiếp bất cứ lúc nào.
+
+
+2. CÁC THÀNH PHẦN FILE TRONG BỘ SOURCE CODE
+--------------------------------------------------------------------------------
+1. scanner_async.py:
+   - Core engine của hệ thống.
+   - Chịu trách nhiệm phân luồng, điều phối truy vấn mạng bất đồng bộ, xử lý lỗi, 
+     retry khi mạng chập chờn và ghi dữ liệu dạng stream JSONL.
+
+2. run_scan.sh:
+   - File script bash điều khiển tự động toàn bộ quy trình:
+     + Kiểm tra file đầu vào và môi trường phụ thuộc.
+     + Tăng giới hạn File Descriptors (ulimit -n) để mở được hàng nghìn socket.
+     + Khởi chạy scanner_async.py với số worker tùy chỉnh.
+     + Tự động gọi merge_results.py sau khi quét xong.
+
+3. setup_wsl2.sh:
+   - Script thiết lập ban đầu cho Ubuntu WSL2:
+     + Cài đặt các thư viện Python (dnspython, aiodns, aiohttp, pyopenssl, uvloop,...).
+     + Cấu hình bypass DNS NAT của WSL2 và tối ưu các tham số socket hệ điều hành.
+
+4. merge_results.py:
+   - Công cụ ghép dữ liệu từ file tạm streaming (results.jsonl) thành 1 file JSON array 
+     chuẩn (scanned_all.json) mà không làm tràn RAM.
+
+5. labeled_domains.csv:
+   - File danh sách tên miền đầu vào và nhãn gán tương ứng (domain, label).
+
+
+3. LUỒNG HOẠT ĐỘNG TỔNG QUAN (WORKFLOW)
+--------------------------------------------------------------------------------
+Bước 1: Nạp danh sách tên miền từ labeled_domains.csv.
+Bước 2: Đối chiếu với danh sách done_domains.txt (nếu đã từng chạy trước đó) để 
+        loại bỏ các domain đã hoàn thành, chỉ quét những domain còn lại (Resume).
+Bước 3: Đưa các domain vào hàng đợi xử lý song song thông qua Semaphore giới hạn.
+Bước 4: Với mỗi domain, thực hiện thu thập đồng thời 4 tầng dữ liệu mạng (DNS, TLS, RDAP Domain, RDAP IP).
+Bước 5: Đóng gói kết quả thành 1 bản ghi JSON hoàn chỉnh.
+Bước 6: Ghi stream (nối đuôi) vào file scan_output/results.jsonl và cập nhật done_domains.txt.
+Bước 7: Sau khi quét xong toàn bộ, merge_results.py gộp toàn bộ thành scanned_all.json.
+
+
+4. CHI TIẾT 4 TẦNG DỮ LIỆU ĐƯỢC THU THẬP CHO MỖI TÊN MIỀN
+--------------------------------------------------------------------------------
+
+[TẦNG 1] THÔNG TIN PHÂN GIẢI TÊN MIỀN (DNS DATA)
+- Cách thức thực hiện:
+  + Sử dụng thư viện dnspython, chạy trong ThreadPoolExecutor (200 workers) để 
+    không làm nghẽn Event Loop.
+  + Sử dụng xoay vòng các DNS Server lớn toàn cầu: 8.8.8.8, 1.1.1.1, 8.8.4.4, 1.0.0.1, 9.9.9.9.
+  + Tích hợp LRU Cache để tái sử dụng kết quả phân giải lặp lại.
+- Dữ liệu thu thập:
+  + Bản ghi A & AAAA: Danh sách các địa chỉ IPv4 và IPv6 của domain.
+  + Bản ghi MX (Mail Exchange): Danh sách máy chủ mail, độ ưu tiên (priority) và 
+    tự động phân giải địa chỉ IP của các mail server đó.
+  + Bản ghi NS (Name Server): Danh sách máy chủ DNS ủy quyền và IP của chúng.
+  + Bản ghi CNAME: Tên miền bí danh / chuyển hướng cấp DNS.
+  + Bản ghi SOA & zone_SOA: Thông tin Primary NS, email người quản trị zone, serial, 
+    refresh, retry, expire và minimum TTL.
+  + Bản ghi TXT & Phân tích cấu hình bảo mật email:
+    * Trích xuất toàn bộ chuỗi TXT.
+    * Tự động phân tích các cờ bảo mật: SPF (v=spf1), DKIM (v=dkim1), DMARC (v=dmarc1).
+  + Bản ghi DNSKEY: Kiểm tra domain có kích hoạt cơ chế bảo mật DNSSEC hay không.
+  + TTL (Time To Live): Thời gian sống lưu cache của từng loại bản ghi.
+
+--------------------------------------------------------------------------------
+
+[TẦNG 2] CHỨNG CHỈ BẢO MẬT & MÃ HÓA (TLS / SSL DATA)
+- Cách thức thực hiện:
+  + Mở kết nối TCP Socket tới cổng 443 của tên miền, thiết lập bắt tay TLS qua pyOpenSSL.
+  + Có hỗ trợ SNI (Server Name Indication) để lấy đúng chứng chỉ của tên miền ảo.
+  + Tự động retry khi gặp lỗi tạm thời của mạng.
+- Dữ liệu thu thập:
+  + Phiên bản giao thức & Thuật toán mã hóa: Tên giao thức (TLSv1.2, TLSv1.3,...) 
+    và tên Cipher Suite (ví dụ: TLS_AES_256_GCM_SHA384).
+  + Toàn bộ chuỗi chứng chỉ (Certificate Chain): Từ chứng chỉ lá (Leaf Certificate), 
+    chứng chỉ trung gian (Intermediate CA) tới chứng chỉ gốc (Root CA).
+  + Thông tin nhà cấp phát (Issuer):
+    * CN (Common Name)
+    * O (Organization - ví dụ: Let's Encrypt, Cloudflare, DigiCert, Sectigo,...)
+    * C (Country)
+  + Thời hạn hiệu lực:
+    * validity_start (Ngày bắt đầu hiệu lực)
+    * validity_end (Ngày hết hạn)
+    * valid_len (Tổng thời gian hiệu lực tính theo giây)
+  + X.509 Extensions: Đầy đủ các trường mở rộng (Subject Alternative Names, 
+    Key Usage, Basic Constraints,...).
+
+--------------------------------------------------------------------------------
+
+[TẦNG 3] THÔNG TIN ĐĂNG KÝ TÊN MIỀN (RDAP DOMAIN - WHOIS THẾ HỆ MỚI)
+- Cách thức thực hiện:
+  + Gửi yêu cầu HTTP GET REST API bất đồng bộ (aiohttp) tới máy chủ RDAP của Registry 
+    quản lý TLD đó (Verisign cho .com/.net, Nominet cho .uk, Afilias cho .org, Google Registry,...) 
+    kết hợp cơ chế Fallback tự động qua rdap.org của IANA.
+- Dữ liệu thu thập:
+  + Các mốc thời gian:
+    * registration_date: Ngày đăng ký domain lần đầu.
+    * last_changed_date: Ngày cập nhật thông tin gần nhất.
+    * expiration_date: Ngày tên miền sẽ hết hạn.
+  + Trạng thái domain (Status): clientTransferProhibited, active, serverHold,...
+  + Thông tin thực thể sở hữu (Entities / vCard):
+    * Registrar (Nhà cung cấp / Đại lý đăng ký tên miền).
+    * Registrant (Chủ thể sở hữu tên miền): Tên, tổ chức, địa chỉ (quốc gia, bang, thành phố), 
+      email, số điện thoại (nếu không bị ẩn bởi dịch vụ Privacy Protection).
+  + Trạng thái ký số DNSSEC từ phía Registry.
+
+--------------------------------------------------------------------------------
+
+[TẦNG 4] THÔNG TIN HẠ TẦNG MẠNG CỦA ĐỊA CHỈ IP (RDAP IP DATA)
+- Cách thức thực hiện:
+  + Với mỗi địa chỉ IP tìm thấy ở Tầng 1 (từ bản ghi A/AAAA), hệ thống truy vấn tới 
+    5 Cơ quan Quản lý Địa chỉ Internet Khu vực (RIRs):
+    * ARIN (Bắc Mỹ)
+    * RIPE NCC (Châu Âu, Trung Đông, Trung Á)
+    * APNIC (Châu Á - Thái Bình Dương)
+    * LACNIC (Mỹ Latinh và Caribbean)
+    * AFRINIC (Châu Phi)
+  + Cơ chế Prefix Caching (/24 đối với IPv4 và /48 đối với IPv6): 
+    Các IP thuộc cùng dải mạng của cùng một nhà mạng/hosting sẽ dùng chung kết quả 
+    cache, giúp giảm tới 70-80% số lượng request ra ngoài và chống bị chặn Rate Limit (429).
+- Dữ liệu thu thập:
+  + Chi tiết mạng CIDR: Địa chỉ mạng, prefix length, netmask, broadcast address.
+  + Tổ chức quản lý hạ tầng / ISP / Data Center (ví dụ: Google LLC, Cloudflare, Amazon AWS, OVH,...).
+  + Quốc gia đăng ký dải IP, loại phân bổ mạng (assignment_type), RIR quản lý.
+
+
+5. CÁC TỐI ƯU KỸ THUẬT QUAN TRỌNG
+--------------------------------------------------------------------------------
+1. Kiến trúc Bất đồng bộ hỗn hợp (Hybrid Concurrency):
+   - Quản lý đồng thời hàng trăm domain bằng asyncio + uvloop.
+   - Các tác vụ chặn socket/DNS được chuyển sang ThreadPoolExecutor riêng biệt.
+
+2. Điều tiết tải bằng Semaphores:
+   - Giới hạn tải riêng cho từng giao thức: SEM_DNS (500), SEM_TLS (200), 
+     SEM_RDAP (150), SEM_IP_RDAP (100) nhằm tránh nghẽn card mạng và router.
+
+3. Streaming I/O tiết kiệm RAM:
+   - Ghi kết quả theo từng dòng JSON Lines (results.jsonl).
+   - Bộ nhớ RAM được thu hồi liên tục, duy trì ổn định ở mức 300MB - 600MB suốt quá trình quét.
+
+4. Khả năng chịu lỗi và Checkpoint (Fault Tolerance):
+   - Tự động lưu tiến độ vào done_domains.txt.
+   - Cho phép người dùng tạm dừng bất cứ lúc nào (Ctrl + C) và tiếp tục quét mà không mất dữ liệu.
+
+5. Định dạng dữ liệu chuẩn hóa:
+   - File kết quả cuối cùng (scanned_all.json) được chuẩn hóa đồng nhất với cấu trúc 
+     của scanned_benign.json, sẵn sàng cho các pipeline trích xuất đặc trưng và 
+     huấn luyện mô hình Học máy.
+================================================================================

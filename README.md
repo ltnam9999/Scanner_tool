@@ -1,4 +1,4 @@
-# 🌐 DomainRadar Async Scanner (High-Performance Domain Feature Extraction)
+# 🌐 Scanner tool (High-Performance Domain Feature Extraction)
 
 [![Python Version](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20WSL2%20(Ubuntu)-orange.svg)](https://ubuntu.com/)
